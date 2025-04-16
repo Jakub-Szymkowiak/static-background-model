@@ -11,9 +11,5 @@ sample_input/
 
 # Possibly large or external codebases – exclude unless you're modifying them
 flowsam/
-RAFT/E2FGVI/
-Video-Depth-Anything/
-gaussian-splatting/
-lama/
-monst3r/
 RAFT/
+lama/
