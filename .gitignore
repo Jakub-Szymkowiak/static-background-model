@@ -1,0 +1,19 @@
+# Checkpoints, model weights, outputs
+Video-Depth-Anything/checkpoints/
+monst3r/checkpoints/
+gaussian-splatting/output/
+lama/output/
+lama/outputs/
+E2FGVI/release_model/
+
+# Input samples (likely reproducible/test data)
+sample_input/
+
+# Possibly large or external codebases – exclude unless you're modifying them
+flowsam/
+RAFT/E2FGVI/
+Video-Depth-Anything/
+gaussian-splatting/
+lama/
+monst3r/
+RAFT/
