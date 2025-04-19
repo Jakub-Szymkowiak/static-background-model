@@ -140,7 +140,7 @@ def get_cameras_from_poses(poses, fovx, fovy, w, h):
 
 def load_gaussians(model_args: ModelParams, iteration):
     with torch.no_grad():
-        gaussians = GaussianModel(model_args.sh_degree)
+        gaussians = GaussianModel(model_args.sh_degree, mode="render")
 
         if iteration == -1:
             load_iteration = searchForMaxIteration(os.path.join(model_args.model_path, "point_cloud"))
@@ -189,14 +189,15 @@ def run_rendering_pipeline():
     model_args, pipeline_args, args = parse_arguments()
 
     gaussians = load_gaussians(model_args, args.iteration)
+    gaussians._global_scale = torch.tensor(-13.0).float().cuda()
     scene = Scene(model_args, gaussians, load_iteration=args.iteration, shuffle=False)
 
     try:
         # use provided camera trajectory
         cam_poses = load_cam_poses_from_file(args.cam_path)
         if args.perturb:
-            T_offset = [0, 0, 0]
-            R_offset = [0, 0, 0] # degrees
+            T_offset = [0, 0, -5]
+            R_offset = [-5.0, 0, 0] # degrees
             cam_poses = apply_pose_perturbation(cam_poses, T_offset, R_offset)
             save_rendering_info(mode="loaded", T_offset=T_offset, R_offset=R_offset, 
                                 res=args.res, fx=args.fx, fy=args.fy, 

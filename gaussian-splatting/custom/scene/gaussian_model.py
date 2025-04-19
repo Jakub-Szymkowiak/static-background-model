@@ -349,7 +349,15 @@ class GaussianModel:
         return l
 
     def save_ply(self, path):
-        mkdir_p(os.path.dirname(path))
+        # save global_scale in extra.info
+        
+        directory = os.path.dirname(path)
+        mkdir_p(directory)
+
+        extra_path = os.path.join(directory, "extra.info")
+        with open(extra_path, "w") as extra_info_f:
+            line = f"global_scale = {self._global_scale}\n"
+            extra_info_f.write(line)
 
         xyz = self.get_xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
