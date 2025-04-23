@@ -55,6 +55,10 @@ class CameraInfo(NamedTuple):
     image_name: str
     depth: np.array
     depth_path: str
+    depth_name: str
+    pointmap: np.array
+    pointmap_path: str
+    pointmap_name: str
     width: int
     height: int
     is_test: Optional[str]
@@ -68,24 +72,6 @@ class SceneInfo(NamedTuple):
     nerf_normalization: dict
     ply_path: str
     is_nerf_synthetic: bool
-
-def getTrajectoryNorm(cam_info, scale_multiplier=1.5):
-    cam_centers = []
-
-    for cam in cam_info:
-        W2C = getWorld2View2(cam.R, cam.T)
-        C2W = np.linalg.inv(W2C)
-        cam_centers.append(C2W[:3, 3:4])  # shape (3, 1)
-
-    cam_centers = np.hstack(cam_centers)  # shape (3, N)
-    center = np.mean(cam_centers, axis=1, keepdims=True)  # shape (3, 1)
-
-    distances = np.linalg.norm(cam_centers - center, axis=0)
-    radius = np.mean(distances) * scale_multiplier
-
-    translate = -center.flatten()
-
-    return {"translate": translate, "radius": radius}
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -169,12 +155,25 @@ def readCameraInfosFromPredTraj(path):
         depth = cv.imread(depth_path, cv.IMREAD_UNCHANGED).astype(np.float32)
         depth = cv.cvtColor(depth, cv.COLOR_RGB2GRAY) 
 
+        depth_name = None
+        depth_path = ""
+        depth = None
+
+        pointmap_name = f"frame_{idx:04d}"
+        pointmap_path = os.path.join(path, "pointmaps", f"{pointmap_name}.npy")
+        pointmap = np.load(pointmap_path)
+
         cam_info = CameraInfo(uid=idx, R=R, T=T,
                               FovY=FovY, FovX=FovX,
-                              image=image, depth=depth,
+                              image=image,
                               image_path=image_path,
                               image_name=image_name,
+                              depth=depth,
                               depth_path=depth_path,
+                              depth_name=depth_name,
+                              pointmap=pointmap,
+                              pointmap_path=pointmap_path,
+                              pointmap_name=pointmap_name,
                               width=width, height=height,
                               is_test=False, depth_params=None)
 

@@ -67,8 +67,9 @@ class Scene:
             path = os.path.join(self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter), "point_cloud.ply")
             self.gaussians.load_ply(path)
         else:
-            self.gaussians.init(cam_infos=scene_info.train_cameras, 
-                                spatial_lr_scale=self.cameras_extent)
+            # self.gaussians.init(cam_infos=scene_info.train_cameras, spatial_lr_scale=self.cameras_extent)
+            glb_path = "/home/computergraphics/Documents/jszymkowiak/mono-vid-dynamic-gs/code/static-background-model/sample_input/bear/gs-input_E2FGVI/scene.glb"
+            self.gaussians.init_from_glb(scene_info.train_cameras, glb_path)
 
 
     def save(self, iteration):

@@ -23,6 +23,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
 import cv2
+import trimesh
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -118,13 +119,15 @@ class GaussianModel:
             # are stored in self.points_cam.
             # They need to be projected into the world coordinates 
             # and scaled using the _global_scale learnable scaling factor. 
-            points_world = []
-            s = torch.nn.functional.softplus(self._global_scale)
-            for pts_cam, R, T in zip(self.points_cam, self.cam_R, self.cam_T):
-                T_scaled = s * T
-                pts_world = (R @ pts_cam.T).T + T_scaled
-                points_world.append(pts_world)
-            return torch.cat(points_world, dim=0)
+            
+            # points_world = []
+            # s = torch.nn.functional.softplus(self._global_scale)
+            # for pts_cam, R, T in zip(self.points_cam, self.cam_R, self.cam_T):
+            #     T_scaled = s * T
+            #     pts_world = (R @ pts_cam.T).T + T_scaled
+            #     points_world.append(pts_world)
+            # return torch.cat(points_world, dim=0)
+            return self._xyz * torch.nn.functional.softplus(self._global_scale)
         elif self.mode == "render":
             # When rendering novel views from a pretrained model,
             # correct xyz locations in world coordinates are loaded from a .ply file,
@@ -197,11 +200,55 @@ class GaussianModel:
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
+    def init_from_glb(self, cam_infos, glb_path: str):
+        scene = trimesh.load(glb_path)
+        geom = scene.geometry["geometry_0"]
+        
+        xyz = torch.tensor(geom.vertices, dtype=torch.float32, device="cuda")
+
+        idx = torch.randperm(xyz.size(0), device="cuda")[:xyz.size(0) // 6]
+        xyz = xyz[idx]
+
+        rgb = torch.ones((xyz.shape[0], 3), dtype=torch.float32, device="cuda")
+
+        sh = RGB2SH(rgb)  # (N, 3)
+
+        print("Number of points at initialisation : ", xyz.shape[0])
+
+        features = torch.zeros((sh.shape[0], 3, (self.max_sh_degree + 1) ** 2), device="cuda")
+        features[:, :3, 0] = sh
+        features[:, 3:, 1:] = 0.0
+
+        dist2 = torch.clamp_min(distCUDA2(xyz).float().cuda(), 1e-7)
+        scales = torch.mean(torch.log(torch.sqrt(dist2))) * torch.ones((xyz.shape[0], 3), device="cuda")
+        rots = torch.zeros((xyz.shape[0], 4), device="cuda")
+        rots[:, 0] = 1.0
+
+        opacities = self.inverse_opacity_activation(
+            0.1 * torch.ones((xyz.shape[0], 1), dtype=torch.float32, device="cuda")
+        )
+
+        self._global_scale = nn.Parameter(torch.tensor(1.0, device="cuda"))
+        self._xyz = nn.Parameter(xyz.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((xyz.shape[0]), device="cuda")
+
+        self.pretrained_exposures = None
+        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
+        self._exposure = nn.Parameter(exposure.requires_grad_(True))
+
+        self.exposure_mapping = {cam.image_name: idx for idx, cam in enumerate(cam_infos)}
+
+        self.turn_off_gradients()
+
+
     def init(self, cam_infos, spatial_lr_scale: float, stride=4):
         self.cam_R = [torch.tensor(cam.R).float().cuda() for cam in cam_infos]
         self.cam_T = [torch.tensor(cam.T).float().cuda() for cam in cam_infos]
-
-        c = max([cam.depth.astype(np.float32).max() for cam in cam_infos]) * 1.1
 
 
         points = []
@@ -210,6 +257,7 @@ class GaussianModel:
         for cam in cam_infos:
             image = cam.image.astype(np.float32) / 255.0
             depth = (c - cam.depth.astype(np.float32)) # * 1e0
+            pointmap = cam.pointmap # new np.array
 
             H, W = cam.height, cam.width    
 
@@ -277,13 +325,15 @@ class GaussianModel:
 
     def turn_off_gradients(self):
         self._xyz.requires_grad = False
-        self._features_dc.requires_grad = False
-        self._features_rest.requires_grad = False
+        #self._features_dc.requires_grad = False
+        #self._features_rest.requires_grad = False
         #self._scaling.requires_grad = False
 
         #self._rotation.requires_grad = False
         #self._opacity.requires_grad = False
         #self._exposure.requires_grad = False
+
+        self._global_scale.requires_grad = False
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
