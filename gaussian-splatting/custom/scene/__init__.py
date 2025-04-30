@@ -15,7 +15,6 @@ import json
 from utils.system_utils import searchForMaxIteration
 from scene import GaussianModel
 from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
 import subprocess
 
@@ -24,6 +23,7 @@ import numpy as np
 from utils.graphics_utils import BasicPointCloud
 
 from custom.scene.dataset_readers import sceneLoadTypeCallbacks
+from custom.utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
 
 class Scene:
@@ -34,7 +34,7 @@ class Scene:
             args: ModelParams, 
             gaussians: GaussianModel, 
             load_iteration=None, 
-            shuffle=True, 
+            shuffle=False, 
             resolution_scales=[1.0],
         ):
 
@@ -50,11 +50,11 @@ class Scene:
             print("Loading trained model at iteration {}".format(self.loaded_iter))
 
         self.train_cameras = {}
-        self.test_cameras = {}
 
-        scene_info = sceneLoadTypeCallbacks["DAS3R+lama"](args.source_path, args.images, args.eval)
+        save_preview = load_iteration is None
+        scene_info = sceneLoadTypeCallbacks["MonST3R"](args.source_path, save_preview=save_preview)
 
-        self.cameras_extent = scene_info.nerf_normalization["radius"]
+        self.cameras_extent = 5.0
 
         if shuffle:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
@@ -67,9 +67,9 @@ class Scene:
             path = os.path.join(self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter), "point_cloud.ply")
             self.gaussians.load_ply(path)
         else:
-            # self.gaussians.init(cam_infos=scene_info.train_cameras, spatial_lr_scale=self.cameras_extent)
-            glb_path = "/home/computergraphics/Documents/jszymkowiak/mono-vid-dynamic-gs/code/static-background-model/sample_input/bear/gs-input_E2FGVI/scene.glb"
-            self.gaussians.init_from_glb(scene_info.train_cameras, glb_path)
+            self.gaussians.create_from_pcd(pcd=scene_info.point_cloud,
+                                           cam_infos=scene_info.train_cameras, 
+                                           spatial_lr_scale=self.cameras_extent)
 
 
     def save(self, iteration):

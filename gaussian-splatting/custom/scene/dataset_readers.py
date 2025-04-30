@@ -36,12 +36,11 @@ from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
-
+from custom.scene.monst3r_processor import Scene, Pose, Preview
 from custom.utils.vo_eval import file_interface
 from custom.utils.pose_utils import quad2rotation
 
-import torch
-import torchvision
+from tqdm import tqdm
 
 
 class CameraInfo(NamedTuple):
@@ -56,9 +55,6 @@ class CameraInfo(NamedTuple):
     depth: np.array
     depth_path: str
     depth_name: str
-    pointmap: np.array
-    pointmap_path: str
-    pointmap_name: str
     width: int
     height: int
     is_test: Optional[str]
@@ -73,97 +69,50 @@ class SceneInfo(NamedTuple):
     ply_path: str
     is_nerf_synthetic: bool
 
-def getNerfppNorm(cam_info):
-    def get_center_and_diag(cam_centers):
-        cam_centers = np.hstack(cam_centers)
-        avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
-        center = avg_cam_center
-        dist = np.linalg.norm(cam_centers - center, axis=0, keepdims=True)
-        diagonal = np.max(dist)
-        return center.flatten(), diagonal
 
-    cam_centers = []
+def readMonST3RSceneInfo(path, save_preview=True):
+    scene = Scene(root_path=path, conf_thrs=0.0, load=True)
+    num_frames = scene.num_frames
 
-    for cam in cam_info:
-        W2C = getWorld2View2(cam.R, cam.T)
-        C2W = np.linalg.inv(W2C)
-        cam_centers.append(C2W[:3, 3:4])
+    scene.align_poses()
+    scene.create_pointcloud(downsample=1)
+    scene.normalize()
+    scene.trim_distant(percent=20)
 
-    center, diagonal = get_center_and_diag(cam_centers)
-    radius = diagonal * 1.1
-
-    translate = -center
-
-    return {"translate": np.zeros(3), "radius": 1}
-
-def tumpose_to_c2w(tum_pose):
-    T = tum_pose[:3]
-    qw, qx, qy, qz = tum_pose[3:]
-    quat = torch.tensor([qx, qy, qz, qw])
-    R = quad2rotation(quat.unsqueeze(0)).squeeze(0).numpy()
-    c2w = np.eye(4)
-    c2w[:3, :3] = R 
-    c2w[:3, 3] = T
+    if save_preview:
+        preview = Preview(scene)
+        preview.render()
     
-    return c2w
+    pointcloud = scene.pointcloud
 
-def load_intrinsics_from_txt(intrinsic_path):
-    intrinsics = []
-    with open(intrinsic_path, "r") as f:
-        for line in f:
-            values = list(map(float, line.strip().split()))
-            K = np.array(values).reshape(3, 3)
-            intrinsics.append(K)
-    return intrinsics
-
-def readCameraInfosFromPredTraj(path):
     cam_infos = []
 
-    traj_path = os.path.join(path, "pred_traj.txt")
-    traj = file_interface.read_tum_trajectory_file(traj_path)
-    traj_tum = np.column_stack((traj.positions_xyz, traj.orientations_quat_wxyz))
-    num_frames = traj_tum.shape[0]
+    for frame_id in tqdm(range(num_frames), desc="Setting up cameras"):
+        frame = scene.get_frame(frame_id)
+        
+        pose = frame.pose # c2w
+        view = pose.inverse # w2c
+        
+        uid = frame_id + 1 
 
-    intrinsic_path = os.path.join(path, "pred_intrinsics.txt")
-    intrinsics = load_intrinsics_from_txt(intrinsic_path)
+        R = view.R
+        T = view.T
 
-    for idx in range(num_frames):
-        sys.stdout.write(f"\rReading frame {idx+1}/{num_frames}")
-        sys.stdout.flush()
+        width, height = round(frame.intrinsics.cx * 2), round(frame.intrinsics.cy * 2)
 
-        pose = tumpose_to_c2w(traj_tum[idx])
-        R = pose[:3, :3]
-        T = pose[:3, 3] 
+        FovX = focal2fov(frame.intrinsics.fx, width)
+        FovY = focal2fov(frame.intrinsics.fy, height)
 
-        K = intrinsics[idx]
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
+        image = frame.image
+        depth = frame.depth
+        
+        image_path = frame.paths["image"]
+        depth_path = frame.paths["depth"]
 
-        width = int(round(cx * 2))
-        height = int(round(cy * 2))
+        image_name = os.path.basename(image_path)
+        depth_name = os.path.basename(depth_path)
 
-        FovX = focal2fov(fx, width)
-        FovY = focal2fov(fy, height)
-
-        image_name = f"image{idx+1}"
-        image_path = os.path.join(path, "images", f"{image_name}.png")
-        image = Image.open(image_path).convert("RGB")
-        image = np.array(image)
-
-        depth_name = f"depth{idx+1}"
-        depth_path = os.path.join(path, "depth_maps", f"{depth_name}.png")
-        depth = cv.imread(depth_path, cv.IMREAD_UNCHANGED).astype(np.float32)
-        depth = cv.cvtColor(depth, cv.COLOR_RGB2GRAY) 
-
-        depth_name = None
-        depth_path = ""
-        depth = None
-
-        pointmap_name = f"frame_{idx:04d}"
-        pointmap_path = os.path.join(path, "pointmaps", f"{pointmap_name}.npy")
-        pointmap = np.load(pointmap_path)
-
-        cam_info = CameraInfo(uid=idx, R=R, T=T,
+        cam_info = CameraInfo(uid=uid, R=R, T=T,
                               FovY=FovY, FovX=FovX,
                               image=image,
                               image_path=image_path,
@@ -171,42 +120,26 @@ def readCameraInfosFromPredTraj(path):
                               depth=depth,
                               depth_path=depth_path,
                               depth_name=depth_name,
-                              pointmap=pointmap,
-                              pointmap_path=pointmap_path,
-                              pointmap_name=pointmap_name,
                               width=width, height=height,
                               is_test=False, depth_params=None)
 
         cam_infos.append(cam_info)
-
-    sys.stdout.write("\n")
-    
-    return cam_infos
-
-def readDAS3RSceneInfo(path, images, eval, llffhold=8):
-    cam_infos_unsorted = readCameraInfosFromPredTraj(path)
-    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
-
-    train_cam_infos = [
-        c for idx, c in enumerate(cam_infos) 
-        if idx % llffhold != 0
-    ]
     
     test_cam_infos = None
 
-    nerf_normalization = getNerfppNorm(train_cam_infos)
-    ply_path = None
-    pcd = None
+    ptc = BasicPointCloud(points=pointcloud.xyz, 
+                          colors=pointcloud.rgb, 
+                          normals=pointcloud.normals)
 
-    scene_info = SceneInfo(point_cloud=pcd,
-                           train_cameras=train_cam_infos,
-                           test_cameras=test_cam_infos,
-                           nerf_normalization=nerf_normalization,
-                           ply_path=ply_path,
-                           is_nerf_synthetic=False)
+    scene_info = SceneInfo(point_cloud=ptc, 
+                           train_cameras=cam_infos, 
+                           test_cameras=None, 
+                           nerf_normalization=None, 
+                           ply_path=None, is_nerf_synthetic=False)
+
     return scene_info
 
 
 sceneLoadTypeCallbacks = {
-    "DAS3R+lama": readDAS3RSceneInfo
+    "MonST3R": readMonST3RSceneInfo
 }

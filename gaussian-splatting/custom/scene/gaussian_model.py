@@ -22,9 +22,6 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
-import cv2
-import trimesh
-
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
 except:
@@ -114,27 +111,7 @@ class GaussianModel:
     
     @property
     def get_xyz(self):
-        if self.mode == "train":
-            # During training, xyz locations in camera coordinates 
-            # are stored in self.points_cam.
-            # They need to be projected into the world coordinates 
-            # and scaled using the _global_scale learnable scaling factor. 
-            
-            # points_world = []
-            # s = torch.nn.functional.softplus(self._global_scale)
-            # for pts_cam, R, T in zip(self.points_cam, self.cam_R, self.cam_T):
-            #     T_scaled = s * T
-            #     pts_world = (R @ pts_cam.T).T + T_scaled
-            #     points_world.append(pts_world)
-            # return torch.cat(points_world, dim=0)
-            return self._xyz * torch.nn.functional.softplus(self._global_scale)
-        elif self.mode == "render":
-            # When rendering novel views from a pretrained model,
-            # correct xyz locations in world coordinates are loaded from a .ply file,
-            # and we simply use them, without any further processing.
-            return self._xyz
-        else:
-            assert None, "Unrecognized mode: " + str(self.mode) 
+        return self._xyz
     
     @property
     def get_features(self):
@@ -171,7 +148,11 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
+    def create_from_pcd(
+        self, 
+        pcd: BasicPointCloud, 
+        cam_infos, 
+        spatial_lr_scale: float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -186,7 +167,8 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        initial_opacity = 1 / len(cam_infos)
+        opacities = self.inverse_opacity_activation(initial_opacity * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -195,145 +177,124 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos[1.0])}
+        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
-    def init_from_glb(self, cam_infos, glb_path: str):
-        scene = trimesh.load(glb_path)
-        geom = scene.geometry["geometry_0"]
+        self._global_scale = nn.Parameter(torch.tensor(1.0).cuda())
+
+        self.turn_off_gradients()
         
-        xyz = torch.tensor(geom.vertices, dtype=torch.float32, device="cuda")
 
-        idx = torch.randperm(xyz.size(0), device="cuda")[:xyz.size(0) // 6]
-        xyz = xyz[idx]
+    def initialize(
+        self,
+        directory: str,
+        cam_infos: list,
+        spatial_lr_scale: float,
+        stride: int=12,
+        conf_thres: float=0.2):
 
-        rgb = torch.ones((xyz.shape[0], 3), dtype=torch.float32, device="cuda")
+        device = "cuda"
 
-        sh = RGB2SH(rgb)  # (N, 3)
+        pts, rgb = [], []
 
-        print("Number of points at initialisation : ", xyz.shape[0])
+        self.points_cam = []
+        self.R = []
+        self.T = []
 
-        features = torch.zeros((sh.shape[0], 3, (self.max_sh_degree + 1) ** 2), device="cuda")
-        features[:, :3, 0] = sh
-        features[:, 3:, 1:] = 0.0
+        for cam in cam_infos:
+            idx = cam.uid
+            image = cam.image
+            depth = cam.depth
+            conf = cam.conf
+            
+            R = cam.R
+            T = cam.T
+            K = cam.K
 
-        dist2 = torch.clamp_min(distCUDA2(xyz).float().cuda(), 1e-7)
-        scales = torch.mean(torch.log(torch.sqrt(dist2))) * torch.ones((xyz.shape[0], 3), device="cuda")
-        rots = torch.zeros((xyz.shape[0], 4), device="cuda")
+            H, W = depth.shape
+            yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+            grid = np.stack((xx, yy), axis=-1) + 0.5
+
+
+            fx, fy = K[0, 0], K[1, 1]
+            cx, cy = K[0, 2], K[1, 2]
+
+            x = (grid[..., 0] - cx) / fx
+            y = (grid[..., 1] - cy) / fy
+            z = np.ones_like(x)
+
+            xyz = np.stack((x, y, z), axis=-1)
+
+            conf_mask = conf < conf_thres
+
+            xyz = xyz[conf_mask]
+            image = image[conf_mask]
+            depth = depth[conf_mask]
+            
+            xyz_flat = xyz.reshape(-1, 3)
+            depth_flat = depth.reshape(-1)
+            rgb_flat = image.reshape(-1, 3)
+
+            points_cam = xyz_flat * depth_flat[:, None]
+
+            to_tensor = lambda arr: torch.from_numpy(arr).float().to(device)
+
+            self.points_cam.append(to_tensor(points_cam[::stride]))
+            self.R.append(to_tensor(R))
+            self.T.append(to_tensor(T))
+
+            rgb.append(to_tensor(rgb_flat[::stride]))
+
+        xyz = torch.cat(self.points_cam, dim=0).to(device).float()
+        rgb = torch.cat(rgb, dim=0).to(device).float() / 255.0
+
+        print(f"Initializing with {xyz.shape[0]} Gaussian components.")
+
+
+        fused_color = RGB2SH(rgb)
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2), device=device)
+        features[:, :3, 0] = fused_color
+
+        dist2 = torch.clamp_min(distCUDA2(xyz).float(), 1e-9)
+        scales = torch.log(torch.sqrt(dist2)).unsqueeze(-1).repeat(1, 3) 
+
+
+        rots = torch.zeros((xyz.shape[0], 4), device=device)
         rots[:, 0] = 1.0
 
-        opacities = self.inverse_opacity_activation(
-            0.1 * torch.ones((xyz.shape[0], 1), dtype=torch.float32, device="cuda")
-        )
+        opacities = self.inverse_opacity_activation(1.0  * torch.ones((xyz.shape[0], 1), dtype=torch.float32, device=device))
 
-        self._global_scale = nn.Parameter(torch.tensor(1.0, device="cuda"))
+
+        self._global_scale = nn.Parameter(torch.tensor(2.0, device=device))
         self._xyz = nn.Parameter(xyz.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.max_radii2D = torch.zeros((xyz.shape[0]), device="cuda")
+
+        self.max_radii2D = torch.zeros((xyz.shape[0]), device=device)
 
         self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
+        exposure = torch.eye(3, 4, device=device).unsqueeze(0).repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
-
         self.exposure_mapping = {cam.image_name: idx for idx, cam in enumerate(cam_infos)}
 
         self.turn_off_gradients()
-
-
-    def init(self, cam_infos, spatial_lr_scale: float, stride=4):
-        self.cam_R = [torch.tensor(cam.R).float().cuda() for cam in cam_infos]
-        self.cam_T = [torch.tensor(cam.T).float().cuda() for cam in cam_infos]
-
-
-        points = []
-        colors = []
-
-        for cam in cam_infos:
-            image = cam.image.astype(np.float32) / 255.0
-            depth = (c - cam.depth.astype(np.float32)) # * 1e0
-            pointmap = cam.pointmap # new np.array
-
-            H, W = cam.height, cam.width    
-
-            stride = 4
-            uu, vv = np.meshgrid(np.arange(0, W, stride), np.arange(0, H, stride))
-            u, v = uu.flatten(), vv.flatten()
-
-            eps = 1e-6
-            z = depth[v, u].flatten()
-            valid = (z > 0) & np.isfinite(z) # sanity check
-            u, v, z = u[valid], v[valid], z[valid]
-
-            _fov2focal = lambda fov, d: 0.5 * d / np.tan(0.5 * fov)
-            fx, fy = _fov2focal(cam.FovX, W), _fov2focal(cam.FovY, H)
-            cx, cy = W / 2.0, H / 2.0
-
-            x = (u - cx) * z / fx
-            y = (v - cy) * z / fy
-
-            rgb = torch.Tensor(image[v, u]).float().cuda()
-            pts = torch.Tensor(np.stack([x, y, z], axis=-1)).float().cuda()
-
-            colors.append(rgb)
-            points.append(pts)
-  
-        self.points_cam = points
-        xyz = torch.cat(points, axis=0)
-
-        print("Number of points at initialisation : ", xyz.shape[0])
-
-        fused_color = RGB2SH(torch.cat(colors, axis=0))
-
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2), device="cuda")
-        features[:, :3, 0] = fused_color
-        features[:, 3:, 1:] = 0.0
-
-        dist2 = torch.clamp_min(distCUDA2(xyz).float().cuda(), 0.0000001)
-        scales = torch.mean(torch.log(torch.sqrt(dist2))) * torch.ones((xyz.shape[0], 3), dtype=torch.float, device="cuda")
-        rots = torch.zeros((xyz.shape[0], 4), device="cuda")
-        rots[:, 0] = 1.0
-
-        opacities = self.inverse_opacity_activation(
-            0.1 * torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda")
-        )
-
-        self._global_scale = nn.Parameter(torch.tensor(1.0, device="cuda"))
-
-        self._xyz = nn.Parameter(xyz.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._scaling = nn.Parameter(scales.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
-        self._opacity = nn.Parameter(opacities.requires_grad_(True))
-
-        self.max_radii2D = torch.zeros((xyz.shape[0]), device="cuda")
-
-        self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
-        self._exposure = nn.Parameter(exposure.requires_grad_(True))
-
-        self.exposure_mapping = {cam.image_name: idx for idx, cam in enumerate(cam_infos)}
-
-        self.turn_off_gradients() 
-
-
+     
     def turn_off_gradients(self):
-        self._xyz.requires_grad = False
-        #self._features_dc.requires_grad = False
-        #self._features_rest.requires_grad = False
-        #self._scaling.requires_grad = False
+        #self._xyz.requires_grad = False
+        self._features_dc.requires_grad = False
+        self._features_rest.requires_grad = False
+        self._scaling.requires_grad = False
 
         #self._rotation.requires_grad = False
         #self._opacity.requires_grad = False
         #self._exposure.requires_grad = False
 
-        self._global_scale.requires_grad = False
+        #self._global_scale.requires_grad = False
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -414,7 +375,7 @@ class GaussianModel:
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
+        scale = self.scaling_inverse_activation(self.get_scaling).detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
